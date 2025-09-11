@@ -1,5 +1,6 @@
 import 'package:onnxruntime/onnxruntime.dart' as ort;
 import 'package:flutter/services.dart' show rootBundle;
+import 'dart:math';
 import 'dart:typed_data';
 
 class ModelService {
@@ -28,7 +29,7 @@ class ModelService {
       _sessionOptions = ort.OrtSessionOptions();
 
       // Load the Fruit model (model.onnx)
-      final fruitRawAssetFile = await rootBundle.load("assets/FruitModel.onnx");
+      final fruitRawAssetFile = await rootBundle.load("assets/CoAtNet.onnx");
       final fruitBytes = fruitRawAssetFile.buffer.asUint8List();
       _fruitSession = ort.OrtSession.fromBuffer(fruitBytes, _sessionOptions!);
 
@@ -72,19 +73,21 @@ class ModelService {
 
     // Process output
     final outputTensor = outputs[0]?.value;
-    List<double> probabilities;
+    final List<double> probabilities;
     if (outputTensor is List && outputTensor.isNotEmpty) {
-      if (outputTensor[0] is List) {
-        probabilities =
-            (outputTensor[0] as List).map((e) => e as double).toList();
+      // The output shape is typically [1, num_classes], which the onnxruntime
+      // package represents as a List<List<double>>. We extract the inner list.
+      if (outputTensor.first is List) {
+        probabilities = List<double>.from(outputTensor.first as List);
       } else {
-        probabilities = outputTensor.map((e) => e as double).toList();
+        // Fallback for a flat list output, shape [num_classes]
+        probabilities = List<double>.from(outputTensor);
       }
     } else {
       throw Exception("Unexpected output format: $outputTensor");
     }
 
-    // Get predicted class
+    // Get predicted class from the probabilities
     final predictedClass = probabilities.indexOf(
       probabilities.reduce((a, b) => a > b ? a : b),
     );
@@ -92,7 +95,7 @@ class ModelService {
     // Clean up input tensor
     inputOrt.release();
 
-    return {'class': predictedClass};
+    return {'class': predictedClass, 'probabilities': probabilities};
   }
 
   String getLabel(int classIndex, String modelType) {

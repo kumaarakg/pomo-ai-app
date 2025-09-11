@@ -3,6 +3,10 @@ import 'package:image_picker/image_picker.dart';
 import 'dart:io';
 import 'image_processor.dart';
 import 'model_service.dart';
+import 'package:csv/csv.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:share_plus/share_plus.dart';
+
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key});
@@ -18,6 +22,9 @@ class _MyHomePageState extends State<MyHomePage> {
   late ImageProcessor _imageProcessor;
   String _selectedModel = 'Fruit'; // Default to Fruit Model
   bool _isLoadingModels = true; // Track model loading state
+  bool _isProcessingImage = false; // Track inference state
+  bool _isBatchProcessing = false; // Track batch processing state
+  final List<List<dynamic>> _csvData = [];
 
   @override
   void initState() {
@@ -25,6 +32,12 @@ class _MyHomePageState extends State<MyHomePage> {
     _modelService = ModelService();
     _imageProcessor = ImageProcessor(_modelService);
     _loadModels();
+    // Add CSV header row
+    _csvData.add([
+      'image',
+      'predicted_class',
+      ..._modelService.fruitLabels, // Assuming fruit model for headers
+    ]);
   }
 
   Future<void> _loadModels() async {
@@ -34,58 +47,108 @@ class _MyHomePageState extends State<MyHomePage> {
     });
   }
 
-  Future<void> pickImageGallery() async {
-    if (_isLoadingModels) {
+  Future<void> _pickAndProcessImage(ImageSource source) async {
+    if (_isLoadingModels || _isProcessingImage) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please wait, models are loading...")),
+        SnackBar(
+            content: Text(_isLoadingModels
+                ? "Please wait, models are loading..."
+                : "Already processing an image.")),
       );
       return;
     }
 
     final ImagePicker picker = ImagePicker();
-    final XFile? image = await picker.pickImage(source: ImageSource.gallery);
+    final XFile? image = await picker.pickImage(source: source);
     if (image == null) return;
 
     File? croppedImage = await _imageProcessor.cropImage(File(image.path));
-    if (croppedImage != null) {
+    if (croppedImage == null) return;
+
+    // Show the image and a loading indicator immediately
+    setState(() {
+      filePath = croppedImage;
+      _isProcessingImage = true;
+      label = "Analyzing...";
+    });
+
+    // Run inference in the background
+    final result =
+        await _imageProcessor.runInference(croppedImage, _selectedModel);
+
+    // Update UI with the result
+    if (mounted) {
       setState(() {
-        filePath = croppedImage;
-      });
-      await _imageProcessor.runInference(croppedImage, _selectedModel, (
-        newLabel,
-      ) {
-        setState(() {
-          label = newLabel;
-        });
+        if (result != null) {
+          label = result['label'] as String;
+          // Store data for CSV export, only for the Fruit model as requested
+          if (_selectedModel == 'Fruit') {
+            _csvData.add([
+              result['imageName'],
+              result['label'],
+              ...(result['probabilities'] as List<double>)
+                  .map((p) => p.toStringAsFixed(3)) // Format to 3 decimal places
+                  .toList(),
+            ]);
+          }
+        } else {
+          label = "Error during analysis";
+        }
+        _isProcessingImage = false;
       });
     }
   }
 
-  Future<void> pickImageCamera() async {
-    if (_isLoadingModels) {
+  Future<void> _runBatchTest() async {
+    if (_isProcessingImage || _isBatchProcessing) return;
+
+    setState(() {
+      _isBatchProcessing = true;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+          content:
+              Text("Running batch test on all images in assets/testing...")),
+    );
+
+    final List<List<dynamic>>? batchCsvData =
+        await _imageProcessor.runBatchInference(_selectedModel);
+
+    if (mounted) {
+      setState(() {
+        _isBatchProcessing = false;
+      });
+    }
+
+    if (batchCsvData != null) {
+      await _shareCsv(batchCsvData, "pomo_ai_batch_predictions.csv");
+    } else if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please wait, models are loading...")),
+        const SnackBar(
+            content: Text("Batch test failed or no images found.")),
+      );
+    }
+  }
+
+  Future<void> _exportAndShareCsv() async {
+    await _shareCsv(_csvData, "pomo_ai_predictions.csv");
+  }
+
+  Future<void> _shareCsv(List<List<dynamic>> data, String fileName) async {
+    if (data.length <= 1) { // Only header exists
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("No data to export.")),
       );
       return;
     }
+    final String csvString = const ListToCsvConverter().convert(data);
+    final Directory directory = await getApplicationDocumentsDirectory();
+    final String path = '${directory.path}/$fileName';
+    final File file = File(path);
+    await file.writeAsString(csvString);
 
-    final ImagePicker picker = ImagePicker();
-    final XFile? image = await picker.pickImage(source: ImageSource.camera);
-    if (image == null) return;
-
-    File? croppedImage = await _imageProcessor.cropImage(File(image.path));
-    if (croppedImage != null) {
-      setState(() {
-        filePath = croppedImage;
-      });
-      await _imageProcessor.runInference(croppedImage, _selectedModel, (
-        newLabel,
-      ) {
-        setState(() {
-          label = newLabel;
-        });
-      });
-    }
+    Share.shareXFiles([XFile(path)], text: 'Here are the Pomo AI predictions!');
   }
 
   @override
@@ -148,12 +211,20 @@ class _MyHomePageState extends State<MyHomePage> {
                               const SizedBox(height: 12),
                               Padding(
                                 padding: const EdgeInsets.all(8.0),
-                                child: Text(
-                                  label,
-                                  style: const TextStyle(
-                                    fontSize: 18,
-                                    fontWeight: FontWeight.bold,
-                                  ),
+                                child: Row(
+                                  mainAxisAlignment: MainAxisAlignment.center,
+                                  children: [
+                                    if (_isProcessingImage) ...[
+                                      const SizedBox(
+                                          height: 20,
+                                          width: 20,
+                                          child: CircularProgressIndicator()),
+                                      const SizedBox(width: 10),
+                                    ],
+                                    Text(label,
+                                        style: const TextStyle(
+                                            fontSize: 18, fontWeight: FontWeight.bold)),
+                                  ],
                                 ),
                               ),
                             ],
@@ -166,7 +237,9 @@ class _MyHomePageState extends State<MyHomePage> {
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           ElevatedButton(
-                            onPressed: () {
+                            onPressed: _isProcessingImage || _isBatchProcessing
+                                ? null
+                                : () {
                               setState(() {
                                 _selectedModel = 'Fruit';
                                 label = "Label"; // Reset label when switching
@@ -182,7 +255,9 @@ class _MyHomePageState extends State<MyHomePage> {
                           ),
                           const SizedBox(width: 12),
                           ElevatedButton(
-                            onPressed: () {
+                            onPressed: _isProcessingImage || _isBatchProcessing
+                                ? null
+                                : () {
                               setState(() {
                                 _selectedModel = 'Leaf';
                                 label = "Label"; // Reset label when switching
@@ -203,13 +278,30 @@ class _MyHomePageState extends State<MyHomePage> {
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
                           ElevatedButton(
-                            onPressed: pickImageGallery,
+                            onPressed: _isProcessingImage || _isBatchProcessing ? null : () =>
+                                _pickAndProcessImage(ImageSource.gallery),
                             child: const Text("Gallery"),
                           ),
                           const SizedBox(width: 12),
                           ElevatedButton(
-                            onPressed: pickImageCamera,
+                            onPressed: _isProcessingImage || _isBatchProcessing ? null : () =>
+                                _pickAndProcessImage(ImageSource.camera),
                             child: const Text("Camera"),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          ElevatedButton(
+                            onPressed: _isProcessingImage || _isBatchProcessing ? null : _exportAndShareCsv,
+                            child: const Text("Export CSV"),
+                          ),
+                          const SizedBox(width: 12),
+                          ElevatedButton(
+                            onPressed: _isProcessingImage || _isBatchProcessing ? null : _runBatchTest,
+                            child: const Text("Run Batch Test"),
                           ),
                         ],
                       ),
